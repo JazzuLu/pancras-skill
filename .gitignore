@@ -1,0 +1,22 @@
+# 本机缓存 / 编辑器 / 派生目录
+.DS_Store
+.ruff_cache/
+.omo/
+.omc/
+.codegraph
+.agents/
+.claude/
+__pycache__/
+*.pyc
+*.log
+
+# 大文件：模型、虚拟环境、抓包日志
+douyin-transcriber/models/
+wechat-extractor/.venv/
+xhs-wechat-extractor/
+
+# 嵌套的独立 git 仓库（已有自己的 GitHub repo，见 README）
+wechat-extractor/
+
+# 本机全盘盘点报告（含全机路径，不外发）
+SKILL_INVENTORY.md

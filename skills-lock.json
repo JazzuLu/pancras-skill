@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "skills": {
+    "wechat-extractor": {
+      "source": "JazzuLu/wechat-extractor",
+      "sourceType": "github",
+      "skillPath": "SKILL.md",
+      "computedHash": "42968dda571fd0e9183c0a75f9d0086ed9ea5a0292f7532e9e76ac8cceeb9090"
+    }
+  }
+}
