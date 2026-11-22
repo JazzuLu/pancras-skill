@@ -12,7 +12,7 @@
 | `wechat-extractor` | 批量提取公众号文章指标（阅读/赞/在看/正文/作者/图片）为统一 Markdown 格式。内容走 fetch.py 文本直抓（零视觉 token），指标走 Kimi cu 截图 footer；含环境自检、fallback 链与增量/汇总/下载图片增强 | 2026-08-07 |
 | `mosh-tmux-remote` | 手机 Termux 经直连/中转用 mosh+tmux 连回工作主机：三模式决策树、端口与会话名锁定、手机复制即用命令、排错速查 | 2026-10-13 |
 | `x-ego-send` | X 短帖/短链、长文 Article、评论区回复都只走本机 Ego 浏览器 | 2026-11-15 |
-| `ego-gemini-assist` | 用 Ego 里已登录的 Gemini 审稿、出爆款标题、起草；含输入框卡死等坑 | 2026-11-22 |
+| `gemini-ego` | Gemini 网页版只走本机 Ego 浏览器：续对话提问、写稿、审稿、爆款标题、生图（含 `.ql-editor` 卡死等 live 实测坑） | 2026-11-22 |
 | `wechat-mp-draft` | 公众号稿存草稿箱：API 优先（凭据在 `~/.secrets/wechat.env`），Ego 后台兜底，update 501 删了重建 | 2026-11-22 |
 
 > `wechat-extractor/` 是本机独立 git 仓库，已单独托管在 `JazzuLu/wechat-extractor`，不纳入本仓库（见 `.gitignore`）。模型、`.venv`、抓包日志、本机全盘盘点报告同样不入库。
