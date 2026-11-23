@@ -5,7 +5,7 @@ description: 把硅基茶馆2077的公众号稿存进微信草稿箱。用户说
 
 # 公众号草稿
 
-脚本在 grok-bot-workspace：`skills/wechat-publish/scripts/wx_draft.py`。稿件目录 `content/03-drafts/<slug>/`，HTML 用 baoyu-markdown-to-html 的 grace 主题、主色 `#C2410C`。
+脚本在 grok-bot-workspace：`skills/wechat-publish/scripts/wx_draft.py`。稿件目录 `content/03-drafts/<slug>/`，HTML 用 baoyu-markdown-to-html 的 grace 主题、主色 `#0F766E`（墨绿，2026-11-16 已定）。
 
 ## 凭据
 

@@ -1,27 +1,38 @@
-// gemini-ask.mjs — v0.2.1 (2026-11-22)
+// gemini-ask.mjs — v0.3.0 (2026-11-23)
 // Fixed flow: ask or continue a Gemini web conversation in the local Mac Ego browser.
 // Incorporates live Gemini pitfalls from ego-gemini-assist & ego-browser guide v2.2.1:
 //   - NEVER page.click() or page.fill() on .ql-editor (hangs page/taskSpace)
 //   - NEVER execCommand("insertText") for long text
 //   - Focus .ql-editor via page.evaluate() with explicit Range, paste via keyboard.paste(),
-//     verify head/tail in innerText (&nbsp; normalized)
+//     poll until paste settles, verify head/tail in innerText (&nbsp; normalized)
 //   - Send via scoped Send message button, confirm send started, wait until typing/stop
-//     indicators clear and the latest model-response turn stabilizes
-//   - Soft-handle page.goto() 15s timeout ONLY when landed on the intended /app target
+//     indicators clear and the latest model-response turn stabilizes (live DOM, no cloneNode)
+//   - Soft-handle page.goto() 15s timeout ONLY when landed on the intended /app or /gem target
+//   - Support sessionFile (1:1 article-to-conversation binding, two-phase atomic persistence,
+//     anti-resend lock), newChat (inherits /u/<n> account prefix), startUrl (/app or /gem),
+//     contextFiles (new-chat injection + SHA-256 change detection + double-injection guard),
+//     and maxPromptChars guard
 //   - Check login wall & optional expectedAccount (never log emails or raw snapshots to stdout)
 //   - Support extract-only mode (empty prompt + empty promptFile) without reloading the page
 //   - Respect ego-browser finish() semantics (invalidated page labels return page: null)
 
 // ===================== DEFAULT_INPUT (for direct heredoc use) =====================
 const DEFAULT_INPUT = {
-  prompt: "",          // exact prompt text (leave empty + set promptFile for long text)
-  promptFile: "",      // absolute path of a file holding the prompt
-  convUrl: "",         // Gemini /app conversation URL; "" keeps current tab or opens /app
-  spaceId: null,       // integer spaceId from previous run; null = create new space
+  prompt: "",              // exact prompt text (leave empty + set promptFile for long text)
+  promptFile: "",          // absolute path of a file holding the prompt
+  sessionFile: "",         // optional absolute path to gemini-session.json (1:1 conversation binding)
+  convUrl: "",             // explicit Gemini /app or /gem conversation URL (mutually exclusive with sessionFile)
+  startUrl: "",            // optional new-chat entry URL (default /app or /u/<n>/app; supports /gem/<id>)
+  newChat: false,          // true = start a fresh conversation (archives old sessionFile.convUrl into previousUrls)
+  forceSend: false,        // true = override pending_response anti-resend lock on sessionFile
+  contextFiles: [],        // optional array of absolute file paths injected on new chat first turn
+  onContextChange: "warn", // "warn" | "reinject" | "error" when contextFiles hash changes on follow-up turn
+  maxPromptChars: 30000,   // safety cap to prevent Gemini auto-converting huge pastes into attachments
+  spaceId: null,           // integer spaceId from previous run (auto-read from sessionFile when set)
   spaceName: "gemini-web",
-  expectedAccount: "", // optional account substring to verify (never logged)
-  outFile: "",         // required absolute path: response text is written here
-  finish: true,        // true = task.finish({ keep: [label] }); false = keep space active in reply
+  expectedAccount: "",     // optional account substring to verify (never logged)
+  outFile: "",             // required absolute path: response text is written here
+  finish: true,            // true = task.finish({ keep: [label] }); false = keep space active in reply
 };
 // ==================================================================================
 
@@ -32,15 +43,18 @@ const INPUT = {
 
 const fs = await import("node:fs/promises");
 const path = await import("node:path");
+const crypto = await import("node:crypto");
 
 const GEMINI_HOME = "https://gemini.google.com/app";
+const EMBEDDED_CORPUS_MARKER = "<!-- CORPUS_CONTEXT_EMBEDDED -->";
 const GOTO_TIMEOUT_MS = 15000;
 const UI_WAIT_TIMEOUT_MS = 10000;
 const UI_POLL_MS = 500;
 const SEND_BUTTON_WAIT_MS = 5000;
 const SEND_BUTTON_POLL_MS = 250;
 const SEND_START_TIMEOUT_MS = 15000;
-const PASTE_SETTLE_MS = 300;
+const PASTE_POLL_MS = 250;
+const PASTE_SETTLE_MAX_MS = 4000;
 const POLL_MS = 2000;
 const MAX_WAIT_MS = 180000;
 const SHORT_RESIDUAL_LIMIT = 2000;
@@ -49,9 +63,14 @@ const STABLE_POLLS_STRUCTURED = 2;
 const STABLE_POLLS_FALLBACK = 4;
 const STABLE_POLLS_EXTRACT_ONLY = 2;
 
-const GEMINI_APP_PATH_RE = /^(\/u\/\d+)?\/app(\/|$)/;
-const GEMINI_HOME_PATH_RE = /^(\/u\/\d+)?\/app\/?$/;
-const GEMINI_CONV_PATH_RE = /^(\/u\/\d+)?\/app\/([^/?#]+)/;
+// Supported Gemini web paths:
+//   Entry pages:        /app, /u/<n>/app, /gem/<gemId>, /u/<n>/gem/<gemId>
+//   Conversation pages: /app/<convId>, /u/<n>/app/<convId>, /gem/<gemId>/<convId>, /u/<n>/gem/<gemId>/<convId>
+const GEMINI_SUPPORTED_PATH_RE = /^(\/u\/\d+)?\/(app|gem)(\/|$)/;
+const GEMINI_APP_HOME_RE = /^(\/u\/\d+)?\/app\/?$/;
+const GEMINI_APP_CONV_RE = /^(\/u\/\d+)?\/app\/([^/?#]+)/;
+const GEMINI_GEM_ENTRY_RE = /^(\/u\/\d+)?\/gem\/([^/?#]+)\/?$/;
+const GEMINI_GEM_CONV_RE = /^(\/u\/\d+)?\/gem\/([^/?#]+)\/([^/?#]+)/;
 
 function out(obj) {
   console.log(JSON.stringify(obj, null, 2));
@@ -77,6 +96,10 @@ function redactSensitive(text) {
   return String(text || "")
     .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}/gi, "[REDACTED_EMAIL]")
     .replace(/Google\s*(Account|账号|帐号|帳戶)\s*[:：][^\n"']*/gi, "Google $1: [REDACTED]");
+}
+
+function sha256Short(text) {
+  return crypto.createHash("sha256").update(String(text || ""), "utf8").digest("hex").slice(0, 12);
 }
 
 function normalizeSpaceId(raw) {
@@ -114,14 +137,15 @@ function parseUrlSafe(url) {
   }
 }
 
-function isGeminiAppUrl(url) {
+function isGeminiSupportedUrl(url) {
   const u = parseUrlSafe(url);
-  return Boolean(u && u.hostname === "gemini.google.com" && GEMINI_APP_PATH_RE.test(u.pathname));
+  return Boolean(u && u.hostname === "gemini.google.com" && GEMINI_SUPPORTED_PATH_RE.test(u.pathname));
 }
 
-function isGeminiHomeUrl(url) {
+function isGeminiEntryUrl(url) {
   const u = parseUrlSafe(url);
-  return Boolean(u && u.hostname === "gemini.google.com" && GEMINI_HOME_PATH_RE.test(u.pathname));
+  if (!u || u.hostname !== "gemini.google.com") return false;
+  return GEMINI_APP_HOME_RE.test(u.pathname) || GEMINI_GEM_ENTRY_RE.test(u.pathname);
 }
 
 function isGoogleLoginUrl(url) {
@@ -129,18 +153,24 @@ function isGoogleLoginUrl(url) {
   return Boolean(u && u.hostname === "accounts.google.com");
 }
 
-function extractConvId(url) {
+function parseGeminiRoute(url) {
   const u = parseUrlSafe(url);
-  if (!u || u.hostname !== "gemini.google.com") return "";
-  const m = u.pathname.match(GEMINI_CONV_PATH_RE);
-  return m ? m[2] : "";
+  if (!u || u.hostname !== "gemini.google.com") return null;
+  const p = u.pathname;
+  let m = p.match(GEMINI_GEM_CONV_RE);
+  if (m) return { accountPrefix: m[1] || "", kind: "gem", gemId: m[2], convId: m[3] };
+  m = p.match(GEMINI_GEM_ENTRY_RE);
+  if (m) return { accountPrefix: m[1] || "", kind: "gem", gemId: m[2], convId: "" };
+  m = p.match(GEMINI_APP_CONV_RE);
+  if (m) return { accountPrefix: m[1] || "", kind: "app", gemId: "", convId: m[2] };
+  m = p.match(GEMINI_APP_HOME_RE);
+  if (m) return { accountPrefix: m[1] || "", kind: "app", gemId: "", convId: "" };
+  return null;
 }
 
 function extractAccountPrefix(url) {
-  const u = parseUrlSafe(url);
-  if (!u || u.hostname !== "gemini.google.com") return "";
-  const m = u.pathname.match(/^(\/u\/\d+)\/app(\/|$)/);
-  return m ? m[1] : "";
+  const r = parseGeminiRoute(url);
+  return r ? r.accountPrefix : "";
 }
 
 function normalizeConvKey(url) {
@@ -155,22 +185,52 @@ function sameConversation(currentUrl, targetUrl) {
 }
 
 function matchesTargetNavigation(curUrl, targetUrl) {
-  if (!isGeminiAppUrl(curUrl)) return false;
-  const targetConvId = extractConvId(targetUrl);
-  const targetAcct = extractAccountPrefix(targetUrl);
-  if (targetAcct && extractAccountPrefix(curUrl) !== targetAcct) {
-    return false;
+  const cur = parseGeminiRoute(curUrl);
+  const tgt = parseGeminiRoute(targetUrl);
+  if (!cur || !tgt) return false;
+  if (tgt.accountPrefix && cur.accountPrefix !== tgt.accountPrefix) return false;
+  if (tgt.kind !== cur.kind) return false;
+  if (tgt.kind === "gem" && cur.gemId !== tgt.gemId) return false;
+  if (tgt.convId) {
+    return cur.convId === tgt.convId;
   }
-  if (targetConvId) {
-    return extractConvId(curUrl) === targetConvId;
-  }
-  // Target is a new-chat home URL (/app or /u/<n>/app): must NOT stay on an old /app/<id>.
-  return isGeminiHomeUrl(curUrl);
+  // Target is a fresh entry URL (/app or /gem/<id>): must NOT remain on an old conversation ID.
+  return cur.convId === "";
+}
+
+function buildNewChatEntryUrl(startUrl, fallbackUrlForPrefix) {
+  if (startUrl) return startUrl;
+  const prefix = extractAccountPrefix(fallbackUrlForPrefix);
+  return prefix ? `https://gemini.google.com${prefix}/app` : GEMINI_HOME;
 }
 
 async function safePageUrl(page, fallback = "") {
   if (!page) return fallback;
   return await page.url().catch(() => fallback);
+}
+
+async function readSessionFile(sessionFilePath) {
+  if (!sessionFilePath) return null;
+  try {
+    const raw = await fs.readFile(sessionFilePath, "utf8");
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== "object" || Array.isArray(data)) {
+      fail("INPUT.sessionFile contains invalid JSON object");
+    }
+    return data;
+  } catch (err) {
+    if (err?.code === "ENOENT") return null;
+    if (err?.__reported) throw err;
+    fail(`failed to read INPUT.sessionFile: ${err?.message || String(err)}`);
+  }
+}
+
+async function writeSessionFileAtomic(sessionFilePath, sessionData) {
+  if (!sessionFilePath) return;
+  await fs.mkdir(path.dirname(sessionFilePath), { recursive: true });
+  const tmpPath = `${sessionFilePath}.${process.pid}.${Date.now()}.tmp`;
+  await fs.writeFile(tmpPath, JSON.stringify(sessionData, null, 2) + "\n", "utf8");
+  await fs.rename(tmpPath, sessionFilePath);
 }
 
 async function writeDebugFile(outFile, title, details) {
@@ -406,7 +466,7 @@ async function resolvePage(task, targetUrl, spaceMode) {
     const uPage = task.userPage();
     if (uPage) {
       const uUrl = await safePageUrl(uPage);
-      if (isGeminiAppUrl(uUrl) || !targetUrl) {
+      if (isGeminiSupportedUrl(uUrl) || !targetUrl) {
         return uPage.label ? task.page(uPage.label) : await task.adopt(uPage);
       }
     }
@@ -422,7 +482,7 @@ async function resolvePage(task, targetUrl, spaceMode) {
     }
     for (const p of managed) {
       const u = await safePageUrl(p);
-      if (isGeminiAppUrl(u)) return p;
+      if (isGeminiSupportedUrl(u)) return p;
     }
     return managed[0];
   }
@@ -434,29 +494,89 @@ async function resolvePage(task, targetUrl, spaceMode) {
 
   const chosen =
     (targetUrl && tabs.find((t) => sameConversation(t.url, targetUrl))) ||
-    tabs.find((t) => isGeminiAppUrl(t.url) && t.active) ||
-    tabs.find((t) => isGeminiAppUrl(t.url)) ||
+    tabs.find((t) => isGeminiSupportedUrl(t.url) && t.active) ||
+    tabs.find((t) => isGeminiSupportedUrl(t.url)) ||
     tabs.find((t) => t.active) ||
     tabs[0];
 
   return chosen.label ? task.page(chosen.label) : await task.adopt(chosen.page);
 }
 
-async function validateInputs() {
+async function loadContextFiles(filePaths) {
+  if (!Array.isArray(filePaths)) {
+    fail("INPUT.contextFiles must be an array of absolute paths");
+  }
+  const items = [];
+  for (const fp of filePaths) {
+    if (typeof fp !== "string" || !path.isAbsolute(fp)) {
+      fail(`every entry in INPUT.contextFiles must be an absolute path: ${String(fp)}`);
+    }
+    const content = normalizeText(await fs.readFile(fp, "utf8"));
+    if (!content) {
+      fail(`contextFile is empty: ${fp}`);
+    }
+    items.push({
+      path: fp,
+      name: path.basename(fp),
+      content,
+      hash: sha256Short(content),
+    });
+  }
+  return items;
+}
+
+function buildContextHashesMap(contextItems) {
+  const map = {};
+  for (const item of contextItems) {
+    map[item.path] = item.hash;
+  }
+  return map;
+}
+
+function assemblePromptWithContext(prompt, items, isIncrementalUpdate) {
+  if (items.length === 0) return prompt;
+  const header = isIncrementalUpdate
+    ? "【规则增量更新：以下背景文件已更新，请以最新版为准覆盖前文对应规则】"
+    : "【以下为本次对话的背景参考与写作规范，请严格遵守】";
+  const blocks = items.map(
+    (item) => `--- ${item.name} (sha256:${item.hash}) ---\n${item.content}`,
+  );
+  return `${header}\n\n${blocks.join("\n\n")}\n\n--- 本次任务 ---\n${prompt}`;
+}
+
+async function validateAndResolvePlan() {
   if (!INPUT.outFile || !path.isAbsolute(INPUT.outFile)) {
     fail("INPUT.outFile is required and must be an absolute path");
   }
   if (INPUT.promptFile && !path.isAbsolute(INPUT.promptFile)) {
     fail("INPUT.promptFile must be an absolute path");
   }
-  if (INPUT.convUrl && !isGeminiAppUrl(INPUT.convUrl)) {
-    fail("INPUT.convUrl must be a https://gemini.google.com/app... URL");
+  if (INPUT.sessionFile && !path.isAbsolute(INPUT.sessionFile)) {
+    fail("INPUT.sessionFile must be an absolute path");
+  }
+  if (INPUT.convUrl && !isGeminiSupportedUrl(INPUT.convUrl)) {
+    fail("INPUT.convUrl must be a https://gemini.google.com/app... or /gem/... URL");
+  }
+  if (INPUT.startUrl && !isGeminiEntryUrl(INPUT.startUrl)) {
+    fail("INPUT.startUrl must be a Gemini entry URL (/app, /u/<n>/app, /gem/<id>, or /u/<n>/gem/<id>)");
   }
   if (typeof INPUT.finish !== "boolean") {
     fail("INPUT.finish must be a boolean");
   }
+  if (typeof INPUT.newChat !== "boolean") {
+    fail("INPUT.newChat must be a boolean");
+  }
+  if (typeof INPUT.forceSend !== "boolean") {
+    fail("INPUT.forceSend must be a boolean");
+  }
+  if (!["warn", "reinject", "error"].includes(INPUT.onContextChange)) {
+    fail('INPUT.onContextChange must be "warn", "reinject", or "error"');
+  }
+  if (typeof INPUT.maxPromptChars !== "number" || INPUT.maxPromptChars <= 0) {
+    fail("INPUT.maxPromptChars must be a positive number");
+  }
 
-  const spaceId = normalizeSpaceId(INPUT.spaceId);
+  const explicitSpaceId = normalizeSpaceId(INPUT.spaceId);
   const inlinePrompt = normalizeText(INPUT.prompt);
   const promptFilePath = String(INPUT.promptFile || "").trim();
 
@@ -464,28 +584,146 @@ async function validateInputs() {
     fail("provide either INPUT.prompt or INPUT.promptFile, not both");
   }
 
-  let prompt = inlinePrompt;
-  if (!prompt && promptFilePath) {
-    prompt = normalizeText(await fs.readFile(promptFilePath, "utf8"));
-    if (!prompt) {
+  let basePrompt = inlinePrompt;
+  let rawPromptFileText = "";
+  if (!basePrompt && promptFilePath) {
+    rawPromptFileText = await fs.readFile(promptFilePath, "utf8");
+    basePrompt = normalizeText(rawPromptFileText);
+    if (!basePrompt) {
       fail("INPUT.promptFile is empty");
     }
   }
 
+  const isExtractOnly = basePrompt.length === 0;
+  if (INPUT.newChat && isExtractOnly) {
+    fail("INPUT.newChat=true cannot be combined with extract-only mode (empty prompt)");
+  }
+
+  const sessionFilePath = String(INPUT.sessionFile || "").trim();
+  const existingSession = await readSessionFile(sessionFilePath);
+
+  if (sessionFilePath && INPUT.convUrl) {
+    if (!existingSession || !sameConversation(existingSession.convUrl, INPUT.convUrl)) {
+      fail("do not pass conflicting INPUT.convUrl alongside INPUT.sessionFile; let sessionFile manage convUrl or use newChat:true");
+    }
+  }
+
+  // Enforce anti-resend lock when previous turn is still pending_response.
+  if (
+    !isExtractOnly &&
+    !INPUT.newChat &&
+    !INPUT.forceSend &&
+    existingSession?.status === "pending_response"
+  ) {
+    fail(
+      "sessionFile is in pending_response state; run extract-only (empty prompt) first to retrieve the previous answer, or set forceSend:true",
+      { spaceId: existingSession.spaceId ?? null, url: existingSession.convUrl || "" },
+    );
+  }
+
+  const hasExistingConv = Boolean(existingSession?.convUrl && !INPUT.newChat);
+  if (hasExistingConv && INPUT.startUrl) {
+    fail("INPUT.startUrl is only valid when starting a new conversation (no existing sessionFile or newChat:true)");
+  }
+
+  const startingFreshChat = sessionFilePath
+    ? !hasExistingConv
+    : Boolean(INPUT.newChat || (INPUT.startUrl && !INPUT.convUrl));
+
+  // Eliminate convUrl="" ambiguity when no sessionFile is given in ask mode.
+  if (!sessionFilePath && !isExtractOnly && !INPUT.convUrl && !startingFreshChat) {
+    fail(
+      "when INPUT.sessionFile is omitted in ask mode, pass either INPUT.convUrl (continue) or INPUT.newChat:true (new conversation)",
+    );
+  }
+
+  // Context files & double-injection guard.
+  const contextItems = await loadContextFiles(INPUT.contextFiles || []);
+  if (
+    contextItems.length > 0 &&
+    (rawPromptFileText.includes(EMBEDDED_CORPUS_MARKER) || basePrompt.includes(EMBEDDED_CORPUS_MARKER))
+  ) {
+    fail(
+      "prompt already contains embedded corpus marker (<!-- CORPUS_CONTEXT_EMBEDDED -->); do not also pass INPUT.contextFiles to avoid double injection",
+    );
+  }
+
+  let finalPrompt = basePrompt;
+  let contextChanged = false;
+  let changedContextFiles = [];
+  let effectiveContextHashes = existingSession?.contextHashes || {};
+
+  if (!isExtractOnly && contextItems.length > 0) {
+    const newHashes = buildContextHashesMap(contextItems);
+    if (startingFreshChat) {
+      finalPrompt = assemblePromptWithContext(basePrompt, contextItems, false);
+      effectiveContextHashes = newHashes;
+    } else {
+      const prevHashes = existingSession?.contextHashes || {};
+      const changedItems = contextItems.filter((item) => prevHashes[item.path] !== item.hash);
+      if (changedItems.length > 0) {
+        contextChanged = true;
+        changedContextFiles = changedItems.map((i) => i.path);
+        if (INPUT.onContextChange === "error") {
+          fail("contextFiles changed since conversation started (onContextChange=error)", {
+            changedFiles: changedContextFiles,
+            spaceId: existingSession?.spaceId ?? null,
+            url: existingSession?.convUrl || "",
+          });
+        } else if (INPUT.onContextChange === "reinject") {
+          finalPrompt = assemblePromptWithContext(basePrompt, changedItems, true);
+          effectiveContextHashes = { ...prevHashes, ...newHashes };
+        }
+      }
+    }
+  }
+
+  if (!isExtractOnly && finalPrompt.length > INPUT.maxPromptChars) {
+    fail(
+      `assembled prompt length (${finalPrompt.length}) exceeds maxPromptChars (${INPUT.maxPromptChars}); trim context or use summary mode for reference articles`,
+      { promptLength: finalPrompt.length, maxPromptChars: INPUT.maxPromptChars },
+    );
+  }
+
+  const effectiveSpaceId =
+    explicitSpaceId !== null
+      ? explicitSpaceId
+      : normalizeSpaceId(existingSession?.spaceId ?? null);
+
+  const targetConvUrl = startingFreshChat
+    ? ""
+    : INPUT.convUrl || existingSession?.convUrl || "";
+
+  const previousUrls = Array.isArray(existingSession?.previousUrls)
+    ? [...existingSession.previousUrls]
+    : [];
+  if (INPUT.newChat && existingSession?.convUrl && !previousUrls.includes(existingSession.convUrl)) {
+    previousUrls.push(existingSession.convUrl);
+  }
+
   return {
-    prompt,
-    isExtractOnly: prompt.length === 0,
-    spaceId,
+    prompt: finalPrompt,
+    isExtractOnly,
+    sessionFilePath,
+    existingSession,
+    startingFreshChat,
+    spaceId: effectiveSpaceId,
+    targetConvUrl,
+    startUrl: INPUT.startUrl || "",
+    previousUrls,
+    contextChanged,
+    changedContextFiles,
+    effectiveContextHashes,
   };
 }
 
 async function waitForUiAndVerifyAuth(task, page, expectedAccount) {
   const currentUrl = await safePageUrl(page);
-  if (isGoogleLoginUrl(currentUrl) || !isGeminiAppUrl(currentUrl)) {
+  if (isGoogleLoginUrl(currentUrl) || !isGeminiSupportedUrl(currentUrl)) {
     await handOffAndFail(
       task,
       page,
-      "redirected away from Gemini /app (login wall or unexpected page); handed off to user",
+      "redirected away from Gemini (/app or /gem); handed off to user",
     );
   }
 
@@ -510,6 +748,32 @@ async function waitForUiAndVerifyAuth(task, page, expectedAccount) {
     );
   }
   return state;
+}
+
+async function waitForPasteSettled(page, expectedLen) {
+  const start = Date.now();
+  let prevLen = -1;
+  let stable = 0;
+  let latestRaw = "";
+  while (Date.now() - start < PASTE_SETTLE_MAX_MS) {
+    await page.waitForTimeout(PASTE_POLL_MS);
+    latestRaw = await page.evaluate(() => {
+      const el = document.querySelector(".ql-editor");
+      return el ? el.innerText || "" : "";
+    });
+    const curLen = normalizeCompact(latestRaw).length;
+    if (curLen >= expectedLen && curLen === prevLen) {
+      stable += 1;
+      if (stable >= 1) return latestRaw;
+    } else if (curLen > 0 && curLen === prevLen) {
+      stable += 1;
+      if (stable >= 2) return latestRaw;
+    } else {
+      prevLen = curLen;
+      stable = 0;
+    }
+  }
+  return latestRaw;
 }
 
 async function pasteAndSend(task, page, prompt, preSendState) {
@@ -553,14 +817,10 @@ async function pasteAndSend(task, page, prompt, preSendState) {
   }
 
   await page.keyboard.paste(prompt);
-  await page.waitForTimeout(PASTE_SETTLE_MS);
+  const expectedCompact = normalizeCompact(prompt);
+  const pastedRaw = await waitForPasteSettled(page, expectedCompact.length);
 
   // Verify head & tail in .ql-editor innerText (&nbsp; normalized).
-  const pastedRaw = await page.evaluate(() => {
-    const el = document.querySelector(".ql-editor");
-    return el ? el.innerText || "" : "";
-  });
-  const expectedCompact = normalizeCompact(prompt);
   const pastedCompact = normalizeCompact(pastedRaw);
   const checkLen = Math.min(VERIFY_EDGE_CHARS, expectedCompact.length);
   const headOk = pastedCompact.startsWith(expectedCompact.slice(0, checkLen));
@@ -657,14 +917,21 @@ async function pasteAndSend(task, page, prompt, preSendState) {
   );
 }
 
-async function waitForAnswer(task, page, isExtractOnly, preSendState, postSendState) {
+async function waitForAnswer(task, page, isExtractOnly, preSendState, postSendState, onUrlChange) {
   let latest = postSendState;
   const waitStart = Date.now();
   let sawBusy = latest.isTyping || latest.hasStopButton;
   let prevSample = "";
   let stableHits = 0;
+  let lastObservedUrl = await safePageUrl(page);
 
   while (Date.now() - waitStart < MAX_WAIT_MS) {
+    const curUrl = await safePageUrl(page);
+    if (curUrl && curUrl !== lastObservedUrl && parseGeminiRoute(curUrl)?.convId) {
+      lastObservedUrl = curUrl;
+      if (onUrlChange) await onUrlChange(curUrl);
+    }
+
     const busy = latest.isTyping || latest.hasStopButton;
     const hasStructured = latest.responseCount > 0;
     const structuredAdvanced =
@@ -685,9 +952,7 @@ async function waitForAnswer(task, page, isExtractOnly, preSendState, postSendSt
           return { completed: true, latest };
         }
       } else if (!hasStructured) {
-        // On a blank /app home page with no model turns, do not falsely succeed.
-        const curUrl = await safePageUrl(page);
-        if (isGeminiHomeUrl(curUrl)) {
+        if (isGeminiEntryUrl(curUrl)) {
           return { completed: true, latest, emptyHome: true };
         }
         if (sample && sample === prevSample) {
@@ -704,7 +969,6 @@ async function waitForAnswer(task, page, isExtractOnly, preSendState, postSendSt
         stableHits = 0;
       }
     } else {
-      // Ask mode: prefer structured model-response turn advancement.
       if (hasStructured && structuredAdvanced) {
         if (latest.lastResponse === prevSample) {
           stableHits += 1;
@@ -722,7 +986,6 @@ async function waitForAnswer(task, page, isExtractOnly, preSendState, postSendSt
         latest.bodyText !== postSendState.bodyText &&
         latest.bodyText.length > 0
       ) {
-        // Fallback only after an explicit busy -> idle transition and post-send body growth.
         if (latest.bodyText === prevSample) {
           stableHits += 1;
           if (stableHits >= STABLE_POLLS_FALLBACK) {
@@ -746,45 +1009,83 @@ let task = null;
 let page = null;
 
 try {
-  // 1. Validate all inputs BEFORE touching filesystem or browser.
-  const { prompt, isExtractOnly, spaceId } = await validateInputs();
+  // 1. Validate all inputs & resolve session/context plan BEFORE touching filesystem or browser.
+  const plan = await validateAndResolvePlan();
   await fs.mkdir(path.dirname(INPUT.outFile), { recursive: true });
 
   // 2. Open or resume TaskSpace and reuse conversation page.
-  const requireExistingSpace = isExtractOnly && !INPUT.convUrl && spaceId !== null;
-  const opened = await openOrResumeSpace(spaceId, INPUT.spaceName, requireExistingSpace);
+  const requireExistingSpace =
+    plan.isExtractOnly && !plan.targetConvUrl && plan.spaceId !== null;
+  const opened = await openOrResumeSpace(plan.spaceId, INPUT.spaceName, requireExistingSpace);
   task = opened.task;
-  page = await resolvePage(task, INPUT.convUrl, opened.mode);
+  page = await resolvePage(task, plan.targetConvUrl, opened.mode);
 
-  // 3. Navigate only when needed (never reload an existing conversation on extract-only).
+  // 3. Navigate only when required (respecting /u/<n> account prefix & fresh chat semantics).
   const currentUrl = await safePageUrl(page);
-  if (INPUT.convUrl) {
-    if (!sameConversation(currentUrl, INPUT.convUrl)) {
-      await navigateSoft(page, INPUT.convUrl);
+  if (plan.startingFreshChat) {
+    const entryUrl = buildNewChatEntryUrl(
+      plan.startUrl,
+      plan.existingSession?.convUrl || currentUrl,
+    );
+    if (!matchesTargetNavigation(currentUrl, entryUrl)) {
+      await navigateSoft(page, entryUrl);
     }
-  } else if (!isGeminiAppUrl(currentUrl)) {
+  } else if (plan.targetConvUrl) {
+    if (!sameConversation(currentUrl, plan.targetConvUrl)) {
+      await navigateSoft(page, plan.targetConvUrl);
+    }
+  } else if (!isGeminiSupportedUrl(currentUrl)) {
     await navigateSoft(page, GEMINI_HOME);
   }
 
   // 4. Verify login state and optional expectedAccount.
   const preSendState = await waitForUiAndVerifyAuth(task, page, INPUT.expectedAccount);
 
-  // 5. Paste & send prompt (skipped in extract-only mode).
-  const postSendState = isExtractOnly
-    ? preSendState
-    : await pasteAndSend(task, page, prompt, preSendState);
+  // Helper to persist sessionFile cleanly at both Phase 1 (post-send) and Phase 2 (completed).
+  const buildSessionPayload = (status, url, extra = {}) => ({
+    spaceId: task.spaceId,
+    convUrl: url,
+    status,
+    updatedAt: new Date().toISOString(),
+    contextHashes: plan.effectiveContextHashes,
+    previousUrls: plan.previousUrls,
+    ...extra,
+  });
 
-  // 6. Wait for generation completion and extract answer.
+  // 5. Paste & send prompt (skipped in extract-only mode), then Phase 1 atomic persist immediately.
+  const postSendState = plan.isExtractOnly
+    ? preSendState
+    : await pasteAndSend(task, page, plan.prompt, preSendState);
+
+  if (!plan.isExtractOnly && plan.sessionFilePath) {
+    const postSendUrl = await safePageUrl(page);
+    await writeSessionFileAtomic(
+      plan.sessionFilePath,
+      buildSessionPayload("pending_response", postSendUrl, {
+        sentAt: new Date().toISOString(),
+      }),
+    );
+  }
+
+  // 6. Wait for generation completion (updating sessionFile as soon as /app/<id> appears).
   const { completed, latest, emptyHome } = await waitForAnswer(
     task,
     page,
-    isExtractOnly,
+    plan.isExtractOnly,
     preSendState,
     postSendState,
+    async (newConvUrl) => {
+      if (plan.sessionFilePath) {
+        await writeSessionFileAtomic(
+          plan.sessionFilePath,
+          buildSessionPayload("pending_response", newConvUrl),
+        );
+      }
+    },
   );
 
   if (emptyHome) {
-    await failWithContext(task, page, "no conversation answer found on blank Gemini /app home page", {
+    await failWithContext(task, page, "no conversation answer found on blank Gemini entry page", {
       captureDebug: true,
       diagnostics: { responseCount: latest.responseCount },
     });
@@ -823,13 +1124,22 @@ try {
   await writeDebugFile(
     INPUT.outFile,
     "META",
-    `mode=${isExtractOnly ? "extract_only" : "ask"}\nextractionMode=${extractionMode}\nbeforeCount=${preSendState.responseCount}\nafterCount=${latest.responseCount}\n\n=== BEFORE BODY ===\n${preSendState.bodyText}\n\n=== AFTER BODY ===\n${latest.bodyText}`,
+    `mode=${plan.isExtractOnly ? "extract_only" : "ask"}\nextractionMode=${extractionMode}\nbeforeCount=${preSendState.responseCount}\nafterCount=${latest.responseCount}\n\n=== BEFORE BODY ===\n${preSendState.bodyText}\n\n=== AFTER BODY ===\n${latest.bodyText}`,
   );
 
-  // 7. Capture metadata BEFORE finish(): finish() invalidates all page labels.
+  // 7. Capture metadata BEFORE finish() and Phase 2 atomic persist sessionFile.
   const finalSpaceId = task.spaceId;
   const finalPageLabel = page.label;
   const finalUrl = await page.url();
+
+  if (plan.sessionFilePath) {
+    await writeSessionFileAtomic(
+      plan.sessionFilePath,
+      buildSessionPayload("ready", finalUrl, {
+        lastResponseFile: INPUT.outFile,
+      }),
+    );
+  }
 
   if (INPUT.finish) {
     await task.finish({ keep: [finalPageLabel] });
@@ -842,7 +1152,10 @@ try {
     finished: INPUT.finish,
     url: finalUrl,
     responseFile: INPUT.outFile,
+    sessionFile: plan.sessionFilePath || null,
     extractionMode,
+    contextChanged: plan.contextChanged,
+    changedFiles: plan.changedContextFiles,
   });
 } catch (err) {
   if (!err?.__reported) {
