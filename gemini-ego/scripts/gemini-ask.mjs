@@ -138,14 +138,12 @@ function parseUrlSafe(url) {
 }
 
 function isGeminiSupportedUrl(url) {
-  const u = parseUrlSafe(url);
-  return Boolean(u && u.hostname === "gemini.google.com" && GEMINI_SUPPORTED_PATH_RE.test(u.pathname));
+  return Boolean(parseGeminiRoute(url));
 }
 
 function isGeminiEntryUrl(url) {
-  const u = parseUrlSafe(url);
-  if (!u || u.hostname !== "gemini.google.com") return false;
-  return GEMINI_APP_HOME_RE.test(u.pathname) || GEMINI_GEM_ENTRY_RE.test(u.pathname);
+  const r = parseGeminiRoute(url);
+  return Boolean(r && r.convId === "");
 }
 
 function isGoogleLoginUrl(url) {
@@ -153,18 +151,23 @@ function isGoogleLoginUrl(url) {
   return Boolean(u && u.hostname === "accounts.google.com");
 }
 
+function normalizeAccountPrefix(prefix) {
+  if (!prefix || prefix === "/u/0") return "";
+  return prefix;
+}
+
 function parseGeminiRoute(url) {
   const u = parseUrlSafe(url);
   if (!u || u.hostname !== "gemini.google.com") return null;
   const p = u.pathname;
   let m = p.match(GEMINI_GEM_CONV_RE);
-  if (m) return { accountPrefix: m[1] || "", kind: "gem", gemId: m[2], convId: m[3] };
+  if (m) return { accountPrefix: normalizeAccountPrefix(m[1]), kind: "gem", gemId: m[2], convId: m[3] };
   m = p.match(GEMINI_GEM_ENTRY_RE);
-  if (m) return { accountPrefix: m[1] || "", kind: "gem", gemId: m[2], convId: "" };
+  if (m) return { accountPrefix: normalizeAccountPrefix(m[1]), kind: "gem", gemId: m[2], convId: "" };
   m = p.match(GEMINI_APP_CONV_RE);
-  if (m) return { accountPrefix: m[1] || "", kind: "app", gemId: "", convId: m[2] };
+  if (m) return { accountPrefix: normalizeAccountPrefix(m[1]), kind: "app", gemId: "", convId: m[2] };
   m = p.match(GEMINI_APP_HOME_RE);
-  if (m) return { accountPrefix: m[1] || "", kind: "app", gemId: "", convId: "" };
+  if (m) return { accountPrefix: normalizeAccountPrefix(m[1]), kind: "app", gemId: "", convId: "" };
   return null;
 }
 
@@ -174,6 +177,12 @@ function extractAccountPrefix(url) {
 }
 
 function normalizeConvKey(url) {
+  const r = parseGeminiRoute(url);
+  if (r) {
+    const base = `https://gemini.google.com${r.accountPrefix}/${r.kind}`;
+    if (r.kind === "gem") return r.convId ? `${base}/${r.gemId}/${r.convId}` : `${base}/${r.gemId}`;
+    return r.convId ? `${base}/${r.convId}` : base;
+  }
   const u = parseUrlSafe(url);
   if (!u) return String(url || "").trim().replace(/\/+$/, "");
   return `${u.origin}${u.pathname.replace(/\/+$/, "")}`;
@@ -188,7 +197,7 @@ function matchesTargetNavigation(curUrl, targetUrl) {
   const cur = parseGeminiRoute(curUrl);
   const tgt = parseGeminiRoute(targetUrl);
   if (!cur || !tgt) return false;
-  if (tgt.accountPrefix && cur.accountPrefix !== tgt.accountPrefix) return false;
+  if (cur.accountPrefix !== tgt.accountPrefix) return false;
   if (tgt.kind !== cur.kind) return false;
   if (tgt.kind === "gem" && cur.gemId !== tgt.gemId) return false;
   if (tgt.convId) {
@@ -572,8 +581,8 @@ async function validateAndResolvePlan() {
   if (!["warn", "reinject", "error"].includes(INPUT.onContextChange)) {
     fail('INPUT.onContextChange must be "warn", "reinject", or "error"');
   }
-  if (typeof INPUT.maxPromptChars !== "number" || INPUT.maxPromptChars <= 0) {
-    fail("INPUT.maxPromptChars must be a positive number");
+  if (!Number.isFinite(INPUT.maxPromptChars) || INPUT.maxPromptChars <= 0) {
+    fail("INPUT.maxPromptChars must be a finite positive number");
   }
 
   const explicitSpaceId = normalizeSpaceId(INPUT.spaceId);
@@ -598,14 +607,18 @@ async function validateAndResolvePlan() {
   if (INPUT.newChat && isExtractOnly) {
     fail("INPUT.newChat=true cannot be combined with extract-only mode (empty prompt)");
   }
+  if (INPUT.startUrl && isExtractOnly) {
+    fail("INPUT.startUrl cannot be combined with extract-only mode (empty prompt)");
+  }
+  if (INPUT.startUrl && INPUT.convUrl) {
+    fail("INPUT.startUrl cannot be combined with INPUT.convUrl");
+  }
 
   const sessionFilePath = String(INPUT.sessionFile || "").trim();
   const existingSession = await readSessionFile(sessionFilePath);
 
   if (sessionFilePath && INPUT.convUrl) {
-    if (!existingSession || !sameConversation(existingSession.convUrl, INPUT.convUrl)) {
-      fail("do not pass conflicting INPUT.convUrl alongside INPUT.sessionFile; let sessionFile manage convUrl or use newChat:true");
-    }
+    fail("INPUT.sessionFile and INPUT.convUrl are mutually exclusive; let sessionFile manage convUrl or omit sessionFile");
   }
 
   // Enforce anti-resend lock when previous turn is still pending_response.
@@ -621,14 +634,20 @@ async function validateAndResolvePlan() {
     );
   }
 
-  const hasExistingConv = Boolean(existingSession?.convUrl && !INPUT.newChat);
-  if (hasExistingConv && INPUT.startUrl) {
+  const existingHasConv = Boolean(parseGeminiRoute(existingSession?.convUrl)?.convId);
+  const hasExistingSessionForReuse = Boolean(existingSession && !INPUT.newChat && (existingHasConv || existingSession.status === "pending_response"));
+  if (hasExistingSessionForReuse && INPUT.startUrl) {
     fail("INPUT.startUrl is only valid when starting a new conversation (no existing sessionFile or newChat:true)");
   }
+  if (!sessionFilePath && INPUT.startUrl && !INPUT.newChat) {
+    fail("when INPUT.sessionFile is omitted, INPUT.startUrl requires INPUT.newChat=true");
+  }
 
-  const startingFreshChat = sessionFilePath
-    ? !hasExistingConv
-    : Boolean(INPUT.newChat || (INPUT.startUrl && !INPUT.convUrl));
+  const startingFreshChat = isExtractOnly
+    ? false
+    : sessionFilePath
+      ? !hasExistingSessionForReuse
+      : Boolean(INPUT.newChat);
 
   // Eliminate convUrl="" ambiguity when no sessionFile is given in ask mode.
   if (!sessionFilePath && !isExtractOnly && !INPUT.convUrl && !startingFreshChat) {
@@ -645,6 +664,11 @@ async function validateAndResolvePlan() {
   ) {
     fail(
       "prompt already contains embedded corpus marker (<!-- CORPUS_CONTEXT_EMBEDDED -->); do not also pass INPUT.contextFiles to avoid double injection",
+    );
+  }
+  if (!isExtractOnly && !startingFreshChat && !sessionFilePath && contextItems.length > 0) {
+    fail(
+      "passing INPUT.contextFiles on a follow-up turn requires INPUT.sessionFile so prior contextHashes can be compared; omit contextFiles or provide sessionFile",
     );
   }
 
@@ -690,14 +714,20 @@ async function validateAndResolvePlan() {
       ? explicitSpaceId
       : normalizeSpaceId(existingSession?.spaceId ?? null);
 
+  // Only treat existingSession.convUrl as a navigation target if it has an actual convId
+  // (avoid navigating back to blank /app during extract-only recovery!).
   const targetConvUrl = startingFreshChat
     ? ""
-    : INPUT.convUrl || existingSession?.convUrl || "";
+    : INPUT.convUrl || (existingHasConv ? existingSession.convUrl : "");
 
   const previousUrls = Array.isArray(existingSession?.previousUrls)
     ? [...existingSession.previousUrls]
     : [];
-  if (INPUT.newChat && existingSession?.convUrl && !previousUrls.includes(existingSession.convUrl)) {
+  if (
+    INPUT.newChat &&
+    existingHasConv &&
+    !previousUrls.includes(existingSession.convUrl)
+  ) {
     previousUrls.push(existingSession.convUrl);
   }
 
@@ -917,13 +947,21 @@ async function pasteAndSend(task, page, prompt, preSendState) {
   );
 }
 
-async function waitForAnswer(task, page, isExtractOnly, preSendState, postSendState, onUrlChange) {
+async function waitForAnswer(
+  task,
+  page,
+  isExtractOnly,
+  preSendState,
+  postSendState,
+  initialUrl,
+  onUrlChange,
+) {
   let latest = postSendState;
   const waitStart = Date.now();
   let sawBusy = latest.isTyping || latest.hasStopButton;
   let prevSample = "";
   let stableHits = 0;
-  let lastObservedUrl = await safePageUrl(page);
+  let lastObservedUrl = initialUrl || "";
 
   while (Date.now() - waitStart < MAX_WAIT_MS) {
     const curUrl = await safePageUrl(page);
@@ -1057,13 +1095,13 @@ try {
     ? preSendState
     : await pasteAndSend(task, page, plan.prompt, preSendState);
 
+  const sentAt = plan.isExtractOnly ? plan.existingSession?.sentAt : new Date().toISOString();
+  const postSendUrl = await safePageUrl(page);
+
   if (!plan.isExtractOnly && plan.sessionFilePath) {
-    const postSendUrl = await safePageUrl(page);
     await writeSessionFileAtomic(
       plan.sessionFilePath,
-      buildSessionPayload("pending_response", postSendUrl, {
-        sentAt: new Date().toISOString(),
-      }),
+      buildSessionPayload("pending_response", postSendUrl, { sentAt }),
     );
   }
 
@@ -1074,11 +1112,12 @@ try {
     plan.isExtractOnly,
     preSendState,
     postSendState,
+    postSendUrl,
     async (newConvUrl) => {
-      if (plan.sessionFilePath) {
+      if (plan.sessionFilePath && !plan.isExtractOnly) {
         await writeSessionFileAtomic(
           plan.sessionFilePath,
-          buildSessionPayload("pending_response", newConvUrl),
+          buildSessionPayload("pending_response", newConvUrl, { sentAt }),
         );
       }
     },
@@ -1162,7 +1201,7 @@ try {
     const safeUrl = await safePageUrl(page);
     out({
       ok: false,
-      error: err?.message || String(err),
+      error: redactSensitive(err?.message || String(err)),
       handOff: false,
       spaceId: task ? task.spaceId : null,
       page: page ? page.label : null,
