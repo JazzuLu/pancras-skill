@@ -1,4 +1,4 @@
-// gemini-ask.mjs — v0.3.0 (2026-11-23)
+// gemini-ask.mjs — v0.4.0 (2026-11-23)
 // Fixed flow: ask or continue a Gemini web conversation in the local Mac Ego browser.
 // Incorporates live Gemini pitfalls from ego-gemini-assist & ego-browser guide v2.2.1:
 //   - NEVER page.click() or page.fill() on .ql-editor (hangs page/taskSpace)
@@ -8,11 +8,13 @@
 //   - Send via scoped Send message button, confirm send started, wait until typing/stop
 //     indicators clear and the latest model-response turn stabilizes (live DOM, no cloneNode)
 //   - Soft-handle page.goto() 15s timeout ONLY when landed on the intended /app or /gem target
+//   - Fail-closed login check (NEVER send in anonymous/logged-out degraded mode) + anti-misclick
+//     guard blocking any click near Sign out / Cancel sign in / Google Account header menus
+//   - Multi-account slot support via accountIndex (/u/<n>/app) + expectedAccount (never logged)
+//   - Default model verification & safe switching for "Gemini 4 Neon" (strictModel fail-closed)
 //   - Support sessionFile (1:1 article-to-conversation binding, two-phase atomic persistence,
-//     anti-resend lock), newChat (inherits /u/<n> account prefix), startUrl (/app or /gem),
-//     contextFiles (new-chat injection + SHA-256 change detection + double-injection guard),
-//     and maxPromptChars guard
-//   - Check login wall & optional expectedAccount (never log emails or raw snapshots to stdout)
+//     anti-resend lock), newChat, startUrl (/app or /gem), contextFiles, maxPromptChars,
+//     and closeTab (keep tab during ongoing article vs close tab on final wrap-up)
 //   - Support extract-only mode (empty prompt + empty promptFile) without reloading the page
 //   - Respect ego-browser finish() semantics (invalidated page labels return page: null)
 
@@ -28,11 +30,15 @@ const DEFAULT_INPUT = {
   contextFiles: [],        // optional array of absolute file paths injected on new chat first turn
   onContextChange: "warn", // "warn" | "reinject" | "error" when contextFiles hash changes on follow-up turn
   maxPromptChars: 30000,   // safety cap to prevent Gemini auto-converting huge pastes into attachments
+  accountIndex: null,      // optional non-negative integer for /u/<n>/app multi-account slot (0 -> /app)
+  expectedAccount: "",     // optional account substring to verify (never logged)
+  model: "Gemini 4 Neon",  // desired Gemini web model; "" disables model check
+  strictModel: true,       // true = stop & report if desired model cannot be verified/selected
   spaceId: null,           // integer spaceId from previous run (auto-read from sessionFile when set)
   spaceName: "gemini-web",
-  expectedAccount: "",     // optional account substring to verify (never logged)
   outFile: "",             // required absolute path: response text is written here
-  finish: true,            // true = task.finish({ keep: [label] }); false = keep space active in reply
+  finish: true,            // true = task.finish(...); false = keep space active in current reply
+  closeTab: false,         // when finish=true: false keeps conversation tab; true closes tab (keep: [])
 };
 // ==================================================================================
 
@@ -102,20 +108,53 @@ function sha256Short(text) {
   return crypto.createHash("sha256").update(String(text || ""), "utf8").digest("hex").slice(0, 12);
 }
 
-function normalizeSpaceId(raw) {
+function normalizeNonNegativeInt(raw, fieldName) {
   if (raw === null || raw === undefined) return null;
   if (typeof raw === "string") {
     const trimmed = raw.trim();
     if (trimmed === "") return null;
     if (!/^\d+$/.test(trimmed)) {
-      fail("INPUT.spaceId must be a non-negative integer or null");
+      fail(`${fieldName} must be a non-negative integer or null`);
     }
     return Number(trimmed);
   }
   if (typeof raw === "number" && Number.isInteger(raw) && raw >= 0) {
     return raw;
   }
-  fail("INPUT.spaceId must be a non-negative integer or null");
+  fail(`${fieldName} must be a non-negative integer or null`);
+}
+
+function normalizeSpaceId(raw) {
+  return normalizeNonNegativeInt(raw, "INPUT.spaceId");
+}
+
+function normalizeAccountIndex(raw) {
+  return normalizeNonNegativeInt(raw, "INPUT.accountIndex");
+}
+
+function accountIndexToPrefix(accountIndex) {
+  if (accountIndex === null || accountIndex === 0) return "";
+  return `/u/${accountIndex}`;
+}
+
+function normalizeModelTokens(name) {
+  return String(name || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/g, " ")
+    .trim();
+}
+
+function modelMatches(observed, desired) {
+  const obs = normalizeModelTokens(observed);
+  const des = normalizeModelTokens(desired);
+  if (!obs || !des) return false;
+  if (obs === des || obs.includes(des)) return true;
+  const desTokens = des.split(" ").filter(Boolean);
+  const obsTokens = new Set(obs.split(" ").filter(Boolean));
+  if (desTokens.length > 0 && desTokens.every((t) => obsTokens.has(t))) return true;
+  // Also allow UI labels that omit leading "gemini" (e.g. "4 Neon" matching "Gemini 4 Neon").
+  const nonBrand = desTokens.filter((t) => t !== "gemini");
+  return nonBrand.length > 0 && nonBrand.every((t) => obsTokens.has(t));
 }
 
 function normalizeText(str) {
@@ -207,9 +246,12 @@ function matchesTargetNavigation(curUrl, targetUrl) {
   return cur.convId === "";
 }
 
-function buildNewChatEntryUrl(startUrl, fallbackUrlForPrefix) {
+function buildNewChatEntryUrl(startUrl, preferredPrefix, fallbackUrlForPrefix) {
   if (startUrl) return startUrl;
-  const prefix = extractAccountPrefix(fallbackUrlForPrefix);
+  const prefix =
+    preferredPrefix !== null && preferredPrefix !== undefined
+      ? preferredPrefix
+      : extractAccountPrefix(fallbackUrlForPrefix);
   return prefix ? `https://gemini.google.com${prefix}/app` : GEMINI_HOME;
 }
 
@@ -332,7 +374,14 @@ async function readGeminiState(page, expectedAccount) {
       'button[aria-label="登入"]',
       'a[aria-label="登入"]',
     ];
-    const hasSignInControl = signInSelectors.some((sel) => isVisible(document.querySelector(sel)));
+    const signInTextRe = /^(sign\s*in|log\s*in|登录|登入)$/i;
+    const hasSignInControl =
+      signInSelectors.some((sel) => isVisible(document.querySelector(sel))) ||
+      [...document.querySelectorAll("a, button")].some((el) => {
+        if (!isVisible(el)) return false;
+        const txt = clean(el.innerText || el.textContent || "");
+        return signInTextRe.test(txt);
+      });
 
     const accountSelectors = [
       'a[aria-label*="Google Account"]',
@@ -358,6 +407,42 @@ async function readGeminiState(page, expectedAccount) {
       ? true
       : hasAccountControl &&
         accountLabel.toLowerCase().includes(String(acctQuery).toLowerCase());
+
+    // Read currently selected Gemini model from safe model/mode switcher controls (never header/account area).
+    const dangerousAuthRe =
+      /(sign\s*out|log\s*out|stay\s*signed\s*out|cancel\s*sign\s*in|switch\s*account|remove\s*account|manage\s*your\s*google|退出登录|退出账号|退出帐号|退出所有|注销|取消登录|保持登出|保持退出|切换账号|移除账号|管理.*google)/i;
+    const isNearAccountArea = (el) => {
+      if (!el) return true;
+      if (
+        el.closest(
+          '[aria-label*="Google Account"], [aria-label*="Google 账号"], [aria-label*="Google 帐号"], [aria-label*="Google 帳戶"], [href*="Logout"], [href*="accounts.google.com"]',
+        )
+      ) {
+        return true;
+      }
+      const meta = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""} ${clean(el.innerText || "")} ${el.getAttribute("href") || ""}`;
+      return dangerousAuthRe.test(meta);
+    };
+
+    const modelSwitcherSelectors = [
+      "bard-mode-switcher button",
+      '[data-test-id*="bard-mode"] button',
+      'button[data-test-id*="mode-switcher"]',
+      'button[aria-label*="Open mode picker"]',
+      'button[aria-label*="model" i]',
+      'button[aria-label*="模型"]',
+      'button[aria-label*="模式"]',
+    ];
+    let currentModel = "";
+    for (const sel of modelSwitcherSelectors) {
+      const el = document.querySelector(sel);
+      if (!el || !isVisible(el) || isNearAccountArea(el)) continue;
+      const label = clean(el.innerText || el.getAttribute("aria-label") || "");
+      if (label && label.length <= 80) {
+        currentModel = label;
+        break;
+      }
+    }
 
     // Detect typing/busy state using status/live/progress elements — NEVER scan user prompt text
     // or outer feed wrappers that contain user-query / model-response.
@@ -432,6 +517,7 @@ async function readGeminiState(page, expectedAccount) {
       hasSignInControl,
       hasAccountControl,
       expectedAccountMatched,
+      currentModel,
       isTyping: hasTypingIndicator,
       hasStopButton,
       responseCount: responses.length,
@@ -572,6 +658,18 @@ async function validateAndResolvePlan() {
   if (typeof INPUT.finish !== "boolean") {
     fail("INPUT.finish must be a boolean");
   }
+  if (typeof INPUT.closeTab !== "boolean") {
+    fail("INPUT.closeTab must be a boolean");
+  }
+  if (INPUT.closeTab && !INPUT.finish) {
+    fail("INPUT.closeTab=true requires INPUT.finish=true");
+  }
+  if (typeof INPUT.strictModel !== "boolean") {
+    fail("INPUT.strictModel must be a boolean");
+  }
+  if (typeof INPUT.model !== "string") {
+    fail("INPUT.model must be a string (e.g. 'Gemini 4 Neon' or '' to skip check)");
+  }
   if (typeof INPUT.newChat !== "boolean") {
     fail("INPUT.newChat must be a boolean");
   }
@@ -586,6 +684,19 @@ async function validateAndResolvePlan() {
   }
 
   const explicitSpaceId = normalizeSpaceId(INPUT.spaceId);
+  const explicitAccountIndex = normalizeAccountIndex(INPUT.accountIndex);
+  const explicitAccountPrefix =
+    explicitAccountIndex === null ? null : accountIndexToPrefix(explicitAccountIndex);
+  if (explicitAccountPrefix !== null && INPUT.convUrl) {
+    if (extractAccountPrefix(INPUT.convUrl) !== explicitAccountPrefix) {
+      fail("INPUT.accountIndex conflicts with INPUT.convUrl account slot (/u/<n>)");
+    }
+  }
+  if (explicitAccountPrefix !== null && INPUT.startUrl) {
+    if (extractAccountPrefix(INPUT.startUrl) !== explicitAccountPrefix) {
+      fail("INPUT.accountIndex conflicts with INPUT.startUrl account slot (/u/<n>)");
+    }
+  }
   const inlinePrompt = normalizeText(INPUT.prompt);
   const promptFilePath = String(INPUT.promptFile || "").trim();
 
@@ -731,6 +842,27 @@ async function validateAndResolvePlan() {
     previousUrls.push(existingSession.convUrl);
   }
 
+  const sessionAccountPrefix =
+    typeof existingSession?.accountPrefix === "string"
+      ? normalizeAccountPrefix(existingSession.accountPrefix)
+      : existingSession?.convUrl
+        ? extractAccountPrefix(existingSession.convUrl)
+        : null;
+
+  if (
+    explicitAccountPrefix !== null &&
+    sessionAccountPrefix !== null &&
+    !INPUT.newChat &&
+    explicitAccountPrefix !== sessionAccountPrefix
+  ) {
+    fail(
+      "INPUT.accountIndex conflicts with existing sessionFile account slot; pass newChat:true or use a separate sessionFile",
+    );
+  }
+
+  const preferredAccountPrefix =
+    explicitAccountPrefix !== null ? explicitAccountPrefix : sessionAccountPrefix;
+
   return {
     prompt: finalPrompt,
     isExtractOnly,
@@ -740,6 +872,10 @@ async function validateAndResolvePlan() {
     spaceId: effectiveSpaceId,
     targetConvUrl,
     startUrl: INPUT.startUrl || "",
+    preferredAccountPrefix,
+    desiredModel: INPUT.model.trim(),
+    strictModel: INPUT.strictModel,
+    closeTab: INPUT.closeTab,
     previousUrls,
     contextChanged,
     changedContextFiles,
@@ -747,7 +883,7 @@ async function validateAndResolvePlan() {
   };
 }
 
-async function waitForUiAndVerifyAuth(task, page, expectedAccount) {
+async function waitForUiAndVerifyAuth(task, page, expectedAccount, expectedStartUrl) {
   const currentUrl = await safePageUrl(page);
   if (isGoogleLoginUrl(currentUrl) || !isGeminiSupportedUrl(currentUrl)) {
     await handOffAndFail(
@@ -757,18 +893,44 @@ async function waitForUiAndVerifyAuth(task, page, expectedAccount) {
     );
   }
 
+  // If caller explicitly requested a /gem/<id> skill/Gem entry, detect missing Gem redirect to /app.
+  if (expectedStartUrl) {
+    const expRoute = parseGeminiRoute(expectedStartUrl);
+    const curRoute = parseGeminiRoute(currentUrl);
+    if (expRoute?.kind === "gem" && (curRoute?.kind !== "gem" || curRoute?.gemId !== expRoute.gemId)) {
+      await failWithContext(
+        task,
+        page,
+        "requested Gem/Skill startUrl was redirected or unavailable on this account; do not fall back silently",
+        { requestedStartUrl: expectedStartUrl, landedUrl: currentUrl },
+      );
+    }
+  }
+
   let state = await readGeminiState(page, expectedAccount);
   const waitStart = Date.now();
   while (Date.now() - waitStart < UI_WAIT_TIMEOUT_MS) {
     const editorReady = state.hasEditor || state.hasSignInControl;
-    const accountReady = !expectedAccount || state.hasAccountControl || state.hasSignInControl;
-    if (editorReady && accountReady) break;
+    // Fail-closed: always wait for Google Account control (not just when expectedAccount is set)
+    // so we never accidentally send in degraded anonymous/logged-out mode.
+    const authSettled = state.hasAccountControl || state.hasSignInControl;
+    if (editorReady && authSettled) break;
     await page.waitForTimeout(UI_POLL_MS);
     state = await readGeminiState(page, expectedAccount);
   }
 
-  if (state.hasSignInControl && !state.hasAccountControl) {
-    await handOffAndFail(task, page, "Gemini is not signed in; handed off to user");
+  if (state.hasSignInControl || !state.hasAccountControl) {
+    await handOffAndFail(
+      task,
+      page,
+      "Gemini session is signed out or anonymous (degraded model); refusing to send — handed off to user to sign in",
+      {
+        diagnostics: {
+          hasSignInControl: state.hasSignInControl,
+          hasAccountControl: state.hasAccountControl,
+        },
+      },
+    );
   }
   if (expectedAccount && !state.expectedAccountMatched) {
     await handOffAndFail(
@@ -778,6 +940,163 @@ async function waitForUiAndVerifyAuth(task, page, expectedAccount) {
     );
   }
   return state;
+}
+
+async function ensureDesiredModel(task, page, desiredModel, strictModel, preSendState) {
+  if (!desiredModel) {
+    return { model: preSendState.currentModel || "", switched: false, warning: "" };
+  }
+  if (modelMatches(preSendState.currentModel, desiredModel)) {
+    return { model: preSendState.currentModel, switched: false, warning: "" };
+  }
+
+  // Attempt safe model switch using model switcher trigger (strictly blocking auth/sign-out elements).
+  const openResult = await page.evaluate(() => {
+    const clean = (s) => String(s || "").replace(/\u00a0/g, " ").trim();
+    const isVisible = (el) => {
+      if (!el) return false;
+      const style = window.getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+        return false;
+      }
+      const rect = el.getBoundingClientRect();
+      return rect.width > 0 && rect.height > 0;
+    };
+    const dangerousAuthRe =
+      /(sign\s*out|log\s*out|stay\s*signed\s*out|cancel\s*sign\s*in|switch\s*account|remove\s*account|manage\s*your\s*google|退出登录|退出账号|退出帐号|退出所有|注销|取消登录|保持登出|保持退出|切换账号|移除账号|管理.*google)/i;
+    const isSafe = (el) => {
+      if (!el || !isVisible(el)) return false;
+      if (
+        el.closest(
+          '[aria-label*="Google Account"], [aria-label*="Google 账号"], [aria-label*="Google 帐号"], [aria-label*="Google 帳戶"], [href*="Logout"], [href*="accounts.google.com"]',
+        )
+      ) {
+        return false;
+      }
+      const meta = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""} ${clean(el.innerText || "")} ${el.getAttribute("href") || ""}`;
+      return !dangerousAuthRe.test(meta);
+    };
+
+    const selectors = [
+      "bard-mode-switcher button",
+      '[data-test-id*="bard-mode"] button',
+      'button[data-test-id*="mode-switcher"]',
+      'button[aria-label*="Open mode picker"]',
+      'button[aria-label*="model" i]',
+      'button[aria-label*="模型"]',
+      'button[aria-label*="模式"]',
+    ];
+    for (const sel of selectors) {
+      const btn = document.querySelector(sel);
+      if (!btn || !isSafe(btn)) continue;
+      if (btn.disabled || btn.getAttribute("aria-disabled") === "true") continue;
+      btn.click();
+      return { opened: true, selector: sel };
+    }
+    return { opened: false };
+  });
+
+  let availableModels = [];
+  if (openResult.opened) {
+    await page.waitForTimeout(500);
+    const pickResult = await page.evaluate((targetName) => {
+      const clean = (s) => String(s || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+      const norm = (s) =>
+        String(s || "")
+          .toLowerCase()
+          .replace(/[^a-z0-9\u4e00-\u9fff]+/g, " ")
+          .trim();
+      const isVisible = (el) => {
+        if (!el) return false;
+        const style = window.getComputedStyle(el);
+        if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) === 0) {
+          return false;
+        }
+        const rect = el.getBoundingClientRect();
+        return rect.width > 0 && rect.height > 0;
+      };
+      const dangerousAuthRe =
+        /(sign\s*out|log\s*out|stay\s*signed\s*out|cancel\s*sign\s*in|switch\s*account|remove\s*account|manage\s*your\s*google|退出登录|退出账号|退出帐号|退出所有|注销|取消登录|保持登出|保持退出|切换账号|移除账号|管理.*google)/i;
+      const isSafe = (el) => {
+        if (!el || !isVisible(el)) return false;
+        if (
+          el.closest(
+            '[aria-label*="Google Account"], [aria-label*="Google 账号"], [aria-label*="Google 帐号"], [aria-label*="Google 帳戶"], [href*="Logout"], [href*="accounts.google.com"]',
+          )
+        ) {
+          return false;
+        }
+        const meta = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""} ${clean(el.innerText || "")} ${el.getAttribute("href") || ""}`;
+        return !dangerousAuthRe.test(meta);
+      };
+
+      const des = norm(targetName);
+      const desTokens = des.split(" ").filter(Boolean);
+      const nonBrand = desTokens.filter((t) => t !== "gemini");
+      const matches = (label) => {
+        const obs = norm(label);
+        if (!obs || !des) return false;
+        if (obs === des || obs.includes(des)) return true;
+        const obsSet = new Set(obs.split(" ").filter(Boolean));
+        if (desTokens.length > 0 && desTokens.every((t) => obsSet.has(t))) return true;
+        return nonBrand.length > 0 && nonBrand.every((t) => obsSet.has(t));
+      };
+
+      const menuRoots = [...document.querySelectorAll('.cdk-overlay-pane, [role="menu"], [role="listbox"]')].filter(
+        isVisible,
+      );
+      const options = [];
+      for (const root of menuRoots) {
+        for (const el of root.querySelectorAll('[role="menuitem"], [role="menuitemradio"], [role="option"], .mat-mdc-menu-item, button')) {
+          if (!isSafe(el)) continue;
+          const label = clean(el.innerText || el.getAttribute("aria-label") || "");
+          if (!label || label.length > 160) continue;
+          options.push({ el, label });
+        }
+      }
+
+      const hit = options.find((o) => matches(o.label));
+      if (hit) {
+        hit.el.click();
+        return { picked: true, pickedLabel: hit.label, available: options.map((o) => o.label).slice(0, 10) };
+      }
+      return { picked: false, available: options.map((o) => o.label).slice(0, 10) };
+    }, desiredModel);
+
+    availableModels = (pickResult.available || []).map((x) => redactSensitive(x));
+    if (pickResult.picked) {
+      await page.waitForTimeout(500);
+      const verified = await readGeminiState(page, INPUT.expectedAccount);
+      if (
+        modelMatches(verified.currentModel, desiredModel) ||
+        modelMatches(pickResult.pickedLabel, desiredModel)
+      ) {
+        return {
+          model: verified.currentModel || pickResult.pickedLabel,
+          switched: true,
+          warning: "",
+        };
+      }
+    } else {
+      // Close open menu cleanly without clicking arbitrary UI elements.
+      await page.keyboard.press("Escape").catch(() => {});
+    }
+  }
+
+  const msg = `desired model "${desiredModel}" could not be verified or selected (current: "${preSendState.currentModel || "unknown"}")`;
+  if (strictModel) {
+    await failWithContext(task, page, msg, {
+      desiredModel,
+      currentModel: preSendState.currentModel || "",
+      availableModels,
+      captureDebug: true,
+    });
+  }
+  return {
+    model: preSendState.currentModel || "",
+    switched: false,
+    warning: msg,
+  };
 }
 
 async function waitForPasteSettled(page, expectedLen) {
@@ -884,6 +1203,20 @@ async function pasteAndSend(task, page, prompt, preSendState) {
         const rect = el.getBoundingClientRect();
         return rect.width > 0 && rect.height > 0;
       };
+      const dangerousAuthRe =
+        /(sign\s*out|log\s*out|stay\s*signed\s*out|cancel\s*sign\s*in|switch\s*account|remove\s*account|manage\s*your\s*google|退出登录|退出账号|退出帐号|退出所有|注销|取消登录|保持登出|保持退出|切换账号|移除账号|管理.*google)/i;
+      const isSafeClick = (el) => {
+        if (!el || !isVisible(el)) return false;
+        if (
+          el.closest(
+            '[aria-label*="Google Account"], [aria-label*="Google 账号"], [aria-label*="Google 帐号"], [aria-label*="Google 帳戶"], [href*="Logout"], [href*="accounts.google.com"]',
+          )
+        ) {
+          return false;
+        }
+        const meta = `${el.getAttribute("aria-label") || ""} ${el.getAttribute("title") || ""} ${el.innerText || ""} ${el.getAttribute("href") || ""}`;
+        return !dangerousAuthRe.test(meta);
+      };
       const exactSelectors = [
         'button[aria-label="Send message"]',
         'button[aria-label="发送消息"]',
@@ -898,7 +1231,7 @@ async function pasteAndSend(task, page, prompt, preSendState) {
       for (const root of scopes) {
         for (const sel of exactSelectors) {
           const btn = root.querySelector(sel);
-          if (!btn || !isVisible(btn)) continue;
+          if (!btn || !isSafeClick(btn)) continue;
           const disabled = btn.disabled || btn.getAttribute("aria-disabled") === "true";
           if (!disabled) {
             btn.click();
@@ -1060,29 +1393,51 @@ try {
 
   // 3. Navigate only when required (respecting /u/<n> account prefix & fresh chat semantics).
   const currentUrl = await safePageUrl(page);
+  let navigatedEntryUrl = "";
   if (plan.startingFreshChat) {
-    const entryUrl = buildNewChatEntryUrl(
+    navigatedEntryUrl = buildNewChatEntryUrl(
       plan.startUrl,
+      plan.preferredAccountPrefix,
       plan.existingSession?.convUrl || currentUrl,
     );
-    if (!matchesTargetNavigation(currentUrl, entryUrl)) {
-      await navigateSoft(page, entryUrl);
+    if (!matchesTargetNavigation(currentUrl, navigatedEntryUrl)) {
+      await navigateSoft(page, navigatedEntryUrl);
     }
   } else if (plan.targetConvUrl) {
     if (!sameConversation(currentUrl, plan.targetConvUrl)) {
       await navigateSoft(page, plan.targetConvUrl);
     }
   } else if (!isGeminiSupportedUrl(currentUrl)) {
-    await navigateSoft(page, GEMINI_HOME);
+    const fallbackHome = buildNewChatEntryUrl("", plan.preferredAccountPrefix, "");
+    await navigateSoft(page, fallbackHome);
+  } else if (
+    plan.preferredAccountPrefix !== null &&
+    extractAccountPrefix(currentUrl) !== plan.preferredAccountPrefix
+  ) {
+    // Explicit accountIndex requested while on another account slot: switch via URL only.
+    const slotUrl = buildNewChatEntryUrl("", plan.preferredAccountPrefix, "");
+    await navigateSoft(page, slotUrl);
   }
 
-  // 4. Verify login state and optional expectedAccount.
-  const preSendState = await waitForUiAndVerifyAuth(task, page, INPUT.expectedAccount);
+  // 4. Fail-closed login & account verification (never send in anonymous degraded mode).
+  const preSendState = await waitForUiAndVerifyAuth(
+    task,
+    page,
+    INPUT.expectedAccount,
+    plan.startingFreshChat ? plan.startUrl : "",
+  );
+
+  // 4.5 Verify or safely switch to desired model (default: Gemini 4 Neon) in ask mode.
+  const modelResult = plan.isExtractOnly
+    ? { model: preSendState.currentModel || "", switched: false, warning: "" }
+    : await ensureDesiredModel(task, page, plan.desiredModel, plan.strictModel, preSendState);
 
   // Helper to persist sessionFile cleanly at both Phase 1 (post-send) and Phase 2 (completed).
   const buildSessionPayload = (status, url, extra = {}) => ({
-    spaceId: task.spaceId,
+    spaceId: extra.spaceIdOverride !== undefined ? extra.spaceIdOverride : task.spaceId,
     convUrl: url,
+    accountPrefix: extractAccountPrefix(url),
+    model: modelResult.model || plan.desiredModel || "",
     status,
     updatedAt: new Date().toISOString(),
     contextHashes: plan.effectiveContextHashes,
@@ -1170,26 +1525,31 @@ try {
   const finalSpaceId = task.spaceId;
   const finalPageLabel = page.label;
   const finalUrl = await page.url();
+  const closingTab = Boolean(INPUT.finish && plan.closeTab);
 
   if (plan.sessionFilePath) {
-    await writeSessionFileAtomic(
-      plan.sessionFilePath,
-      buildSessionPayload("ready", finalUrl, {
-        lastResponseFile: INPUT.outFile,
-      }),
-    );
+    const payload = buildSessionPayload("ready", finalUrl, {
+      lastResponseFile: INPUT.outFile,
+      spaceIdOverride: closingTab ? null : finalSpaceId,
+    });
+    delete payload.spaceIdOverride;
+    await writeSessionFileAtomic(plan.sessionFilePath, payload);
   }
 
   if (INPUT.finish) {
-    await task.finish({ keep: [finalPageLabel] });
+    await task.finish({ keep: closingTab ? [] : [finalPageLabel] });
   }
 
   out({
     ok: true,
-    spaceId: finalSpaceId,
+    spaceId: closingTab ? null : finalSpaceId,
     page: INPUT.finish ? null : finalPageLabel,
     finished: INPUT.finish,
+    tabClosed: closingTab,
     url: finalUrl,
+    model: modelResult.model,
+    modelSwitched: modelResult.switched,
+    modelWarning: modelResult.warning || undefined,
     responseFile: INPUT.outFile,
     sessionFile: plan.sessionFilePath || null,
     extractionMode,
