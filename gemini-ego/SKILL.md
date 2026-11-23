@@ -15,7 +15,7 @@ allowed-tools:
 metadata:
   version: "0.3.0"
   date: "2026-11-23"
-  status: "merged ego-gemini-assist live pitfalls + sessionFile/contextFiles; pending live smoke test"
+  status: "live smoke passed 2026-11-23 on default /app account: paste, send, model_response, session resume, extract-only, newChat. /u/n and /gem entry were not on this login, not live-tested."
 ---
 
 # Gemini 网页操作（只走本机 Ego）
